@@ -13,10 +13,8 @@ import hydra
 from tdmpc2_jax.wrappers.action_scale import RescaleActions
 import jax.numpy as jnp
 
-os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
 
-
-@hydra.main(config_name='config', config_path='.')
+@hydra.main(config_name='config', config_path='.', version_base=None)
 def train(cfg: dict):
 
   env_config = cfg['env']
