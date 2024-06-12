@@ -1,6 +1,6 @@
 import copy
 from functools import partial
-from typing import Dict, Tuple, Callable
+from typing import Dict, Tuple, Callable, Any
 import flax.linen as nn
 from flax.training.train_state import TrainState
 from flax import struct
@@ -14,7 +14,10 @@ import optax
 from tdmpc2_jax.networks import Ensemble
 import gymnasium as gym
 from tdmpc2_jax.common.util import symlog, two_hot_inv
+from tdmpc2_jax.networks.mlp import BatchRenormedLinear
 
+class ValueTrainState(TrainState):
+  batch_stats: Any
 
 class WorldModel(struct.PyTreeNode):
   # Models
@@ -22,8 +25,7 @@ class WorldModel(struct.PyTreeNode):
   dynamics_model: TrainState
   reward_model: TrainState
   policy_model: TrainState
-  value_model: TrainState
-  target_value_model: TrainState
+  value_model: ValueTrainState
   continue_model: TrainState
   # Spaces
   observation_space: gym.Space = struct.field(pytree_node=False)
@@ -133,27 +135,30 @@ class WorldModel(struct.PyTreeNode):
         ))
 
     # Return/value model (ensemble)
-    value_param_key, value_dropout_key = jax.random.split(value_key)
+    value_param_key, value_dropout_key = jax.random.split(value_key, 2)
     value_base = partial(nn.Sequential, [
-        NormedLinear(mlp_dim, activation=mish,
+        BatchRenormedLinear(mlp_dim, activation=mish,
                      dropout_rate=value_dropout, dtype=dtype),
-        NormedLinear(mlp_dim, activation=mish, dtype=dtype),
+        BatchRenormedLinear(mlp_dim, activation=mish, dtype=dtype),
         nn.Dense(num_bins, kernel_init=nn.initializers.zeros)])
     value_ensemble = Ensemble(value_base, num=num_value_nets)
-    value_model = TrainState.create(
-        apply_fn=value_ensemble.apply,
-        params=value_ensemble.init(
+   
+    variables = value_ensemble.init(
             {'params': value_param_key, 'dropout': value_dropout_key},
-            jnp.zeros(latent_dim + action_dim))['params'],
+            jnp.zeros(latent_dim + action_dim))
+    params = variables['params']
+    batch_stats = variables['batch_stats']
+    del variables
+    value_model = ValueTrainState.create(
+        apply_fn=value_ensemble.apply,
+        params=params,
         tx=optax.chain(
             optax.zero_nans(),
             optax.clip_by_global_norm(max_grad_norm),
             optax.adam(learning_rate),
-        ))
-    target_value_model = TrainState.create(
-        apply_fn=value_ensemble.apply,
-        params=copy.deepcopy(value_model.params),
-        tx=optax.GradientTransformation(lambda _: None, lambda _: None))
+        ),
+          batch_stats=batch_stats,
+        )
 
     if predict_continues:
       continue_module = nn.Sequential([
@@ -218,7 +223,6 @@ class WorldModel(struct.PyTreeNode):
         reward_model=reward_model,
         policy_model=policy_model,
         value_model=value_model,
-        target_value_model=target_value_model,
         continue_model=continue_model,
         # Architecture
         mlp_dim=mlp_dim,
@@ -280,11 +284,12 @@ class WorldModel(struct.PyTreeNode):
     return action, mean, log_std, log_probs
 
   @jax.jit
-  def Q(self, z: jax.Array, a: jax.Array, params: Dict, key: PRNGKeyArray
+  def Q(self, z: jax.Array, a: jax.Array, params: Dict, key: PRNGKeyArray, train: bool
         ) -> Tuple[jax.Array, jax.Array]:
     z = jnp.concatenate([z, a], axis=-1)
-    logits = self.value_model.apply_fn(
-        {'params': params}, z, rngs={'dropout': key})
+    # TODO: figure out why including train as an argument breaks things.
+    logits, updates = self.value_model.apply_fn(
+        {'params': params, 'batch_stats': self.value_model.batch_stats}, z, rngs={'dropout': key}, mutable=['batch_stats'])
 
     Q = two_hot_inv(logits, self.symlog_min, self.symlog_max, self.num_bins)
-    return Q, logits
+    return Q, logits, updates

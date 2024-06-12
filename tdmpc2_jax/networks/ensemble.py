@@ -8,7 +8,8 @@ class Ensemble(nn.Module):
     @nn.compact
     def __call__(self, *args, **kwargs):
         ensemble = nn.vmap(self.base_module,
-                           variable_axes={'params': 0},
+                           # TODO: figure out if batch_stats should be lifted.
+                           variable_axes={'params': 0, 'batch_stats': 0},
                            split_rngs={
                                'params': True,
                                'dropout': True
